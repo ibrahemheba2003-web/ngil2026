@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
-import type { AskResult, ContentLevel, ManhajReport, PassageKind } from "./types";
+import { APPROVED_DOMAINS, isApprovedHost } from "./approved-sources";
+import type { AskResult, Citation, ContentLevel, ManhajReport, PassageKind } from "./types";
 
 type ChunkIn = {
   sourceId: string;
@@ -16,49 +17,186 @@ type ChunkIn = {
 
 const POLICY = `أنت محرك «نقل» للتحقق العلمي من المحتوى الإسلامي. لست مفتياً ولا عالماً بشرياً.
 قواعد ملزمة:
-1) أجب فقط من المقاطع المرفقة. إن لم تكفِ فصرّح بعدم كفاية المعلومات ولا تُكمل من حفظك.
-2) لا تختلق حديثاً ولا آية ولا عزواً. لا تنسب قولاً إلى كتاب إن لم يرد في المقاطع.
+1) أجب فقط من المصادر المعتمدة المرفقة أو المسموح بالبحث فيها. إن لم تكفِ فصرّح بعدم كفاية المعلومات ولا تُكمل من حفظك.
+2) لا تختلق حديثاً ولا آية ولا عزواً. لا تنسب قولاً إلى كتاب أو موقع إن لم يرد فيه.
 3) فرّق بين النص القرآني والحديث وبين كلام المفسر/الشرح.
 4) المسائل الخلافية لا تُعرض بصيغة القطع.
 5) لا تُفتِ في واقعة شخصية. إن كان السؤال فتوى شخصية: معلومات عامة فقط مع إحالة إلى جهة مؤهلة.
-6) مستويات المحتوى: أ معلومات أصلية مستقرة، ب شرح واستدلال، ج خلاف/حساسية، د فتوى شخصية.
-7) أظهر المصدر والطبعة ورقم الصفحة في الاستشهاد.
-8) العربية الفصيحة الواضحة، الأصل قبل الفرع.
-9) أنت أداة مدعومة بالذكاء الاصطناعي.`;
+6) مستويات المحتوى: A معلومات أصلية مستقرة، B شرح واستدلال، C خلاف/حساسية، D فتوى شخصية.
+7) أظهر المصدر والطبعة ورقم الصفحة في الاستشهاد إن وُجدت.
+8) افهم السؤال مهما كانت صيغته (عامية أو فصحى أو مختصرة) واستخرج مقصوده الحقيقي قبل الإجابة.
+9) العربية الفصيحة الواضحة، الأصل قبل الفرع.
+10) أنت أداة مدعومة بالذكاء الاصطناعي.`;
+
+// ---------- Gemini ----------
 
 function readKey(): string | null {
-  return process.env.XAI_API_KEY ?? null;
+  return process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY ?? null;
 }
 
-async function complete(messages: unknown[], maxTokens: number): Promise<string> {
+const MODELS = [
+  process.env.GEMINI_MODEL,
+  "gemini-3.1-flash-lite",
+  "gemini-3-flash-preview",
+  "gemini-2.5-flash",
+].filter((m): m is string => Boolean(m));
+
+type Msg = { role: "system" | "user"; content: string | unknown[] };
+type Part = { text: string } | { inline_data: { mime_type: string; data: string } };
+type WebSource = { uri: string; title: string };
+
+function toParts(content: string | unknown[]): Part[] {
+  if (typeof content === "string") return [{ text: content }];
+  const parts: Part[] = [];
+  for (const item of content as Record<string, unknown>[]) {
+    if (item.type === "text") parts.push({ text: String(item.text ?? "") });
+    if (item.type === "image_url") {
+      const url = String((item.image_url as { url: string }).url ?? "");
+      const m = /^data:([^;]+);base64,(.+)$/.exec(url);
+      if (m) parts.push({ inline_data: { mime_type: m[1]!, data: m[2]! } });
+    }
+  }
+  return parts;
+}
+
+async function complete(
+  messages: Msg[],
+  _maxTokens: number,
+  opts: { search?: boolean } = {},
+): Promise<{ text: string; sources: WebSource[] }> {
   const apiKey = readKey();
   if (!apiKey) throw new Error("unavailable");
-  const res = await fetch("https://api.x.ai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: "grok-4.5",
+
+  const system = messages.find((m) => m.role === "system");
+  const contents = messages
+    .filter((m) => m.role !== "system")
+    .map((m) => ({ role: "user", parts: toParts(m.content) }));
+
+  const body: Record<string, unknown> = {
+    contents,
+    generationConfig: {
       temperature: 0.1,
-      max_tokens: maxTokens,
-      response_format: { type: "json_object" },
-      messages,
-    }),
-  });
-  if (!res.ok) {
-    throw new Error(`xAI API error ${res.status}`);
-  }
-  const body = (await res.json()) as {
-    choices: { message: { content: string } }[];
+      maxOutputTokens: 8192,
+      ...(opts.search ? {} : { responseMimeType: "application/json" }),
+    },
   };
-  return body.choices[0]?.message.content ?? "";
+  if (system) body.system_instruction = { parts: toParts(system.content) };
+  if (opts.search) body.tools = [{ google_search: {} }];
+
+  let lastError = "no model";
+  for (const model of MODELS) {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        body: JSON.stringify(body),
+      },
+    );
+    if (!res.ok) {
+      lastError = `Gemini ${model} ${res.status}`;
+      continue; // جرّب النموذج التالي
+    }
+    const json = (await res.json()) as {
+      candidates?: {
+        content?: { parts?: { text?: string }[] };
+        groundingMetadata?: { groundingChunks?: { web?: { uri?: string; title?: string } }[] };
+      }[];
+    };
+    const cand = json.candidates?.[0];
+    const text = (cand?.content?.parts ?? []).map((p) => p.text ?? "").join("");
+    const sources: WebSource[] = (cand?.groundingMetadata?.groundingChunks ?? [])
+      .map((c) => ({ uri: c.web?.uri ?? "", title: c.web?.title ?? "" }))
+      .filter((s) => s.uri);
+    if (text.trim()) return { text, sources };
+    lastError = `Gemini ${model} empty`;
+  }
+  throw new Error(lastError);
 }
 
 function parseJson(text: string): Record<string, unknown> {
-  const trimmed = text.trim().replace(/^```json\s*|\s*```$/g, "");
-  return JSON.parse(trimmed) as Record<string, unknown>;
+  const cleaned = text.trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
+  try {
+    return JSON.parse(cleaned) as Record<string, unknown>;
+  } catch {
+    const a = cleaned.indexOf("{");
+    const b = cleaned.lastIndexOf("}");
+    if (a >= 0 && b > a) return JSON.parse(cleaned.slice(a, b + 1)) as Record<string, unknown>;
+    throw new Error("bad json");
+  }
+}
+
+function webCitations(sources: WebSource[]): Citation[] {
+  const seen = new Set<string>();
+  const out: Citation[] = [];
+  for (const s of sources) {
+    if (!isApprovedHost(`${s.title} ${s.uri}`)) continue; // فقط المواقع المعتمدة
+    if (seen.has(s.uri)) continue;
+    seen.add(s.uri);
+    out.push({
+      sourceId: `web:${s.title}`,
+      title: s.title || "موقع معتمد",
+      author: "موقع معتمد من الحزمة العلمية",
+      edition: "",
+      page: 0,
+      excerpt: "",
+      kind: "other",
+      url: s.uri,
+    });
+  }
+  return out;
+}
+
+const DOMAIN_LIST = APPROVED_DOMAINS.join("، ");
+
+// ---------- اسأل المصدر ----------
+
+async function askFromApprovedWeb(question: string): Promise<AskResult> {
+  const siteHint = APPROVED_DOMAINS.map((d) => `site:${d}`).join(" OR ");
+  const { text, sources } = await complete(
+    [
+      { role: "system", content: POLICY },
+      {
+        role: "user",
+        content: `السؤال: ${question}
+
+ابحث على الويب في المواقع المعتمدة فقط، واستعمل في البحث هذه الصيغة: ${siteHint}
+المواقع المعتمدة: ${DOMAIN_LIST}
+تجاهل أي موقع خارج هذه القائمة تماماً. إن لم تجد جواباً صريحاً في المواقع المعتمدة فاجعل insufficient=true ولا تُجب من حفظك.
+اكتب الجواب مختصراً وواضحاً، وفرّق بين النص (آية/حديث) وبين كلام العلماء، واذكر اسم الموقع الذي أخذت منه.
+أرجع JSON فقط، بلا أي نص خارجه، بالمفاتيح:
+{"answer": string, "level": "A"|"B"|"C"|"D", "insufficient": boolean, "fatwaReferral": boolean, "notes": string[]}`,
+      },
+    ],
+    1600,
+    { search: true },
+  );
+  const json = parseJson(text);
+  const citations = webCitations(sources);
+  const insufficient = Boolean(json.insufficient) || citations.length === 0;
+  if (insufficient) {
+    return {
+      ok: true,
+      level: ((json.level as ContentLevel) || "B") as ContentLevel,
+      insufficient: true,
+      answer:
+        "لم أجد جواباً كافياً في المصادر المعتمدة لهذا السؤال، ولن أُكمل من خارجها. جرّب إعادة صياغة السؤال، أو ارفع الكتاب المعتمد، أو راجع مختصاً.",
+      citations: [],
+      notes: ["الامتناع عند غياب المرجع"],
+    };
+  }
+  return {
+    ok: true,
+    answer: String(json.answer ?? ""),
+    level: ((json.level as ContentLevel) || "B") as ContentLevel,
+    insufficient: false,
+    fatwaReferral: Boolean(json.fatwaReferral),
+    notes: [
+      ...(Array.isArray(json.notes) ? (json.notes as string[]) : []),
+      "الإجابة من مواقع المرجعية العلمية المعتمدة",
+    ],
+    citations,
+  };
 }
 
 export const askFromSources = createServerFn({ method: "POST" })
@@ -79,49 +217,56 @@ export const askFromSources = createServerFn({ method: "POST" })
         notes: ["مستوى د: إحالة إلى مختص"],
       };
     }
-    if (data.chunks.length === 0) {
-      return {
-        ok: true,
-        insufficient: true,
-        level: "B",
-        answer:
-          "لا توجد مقاطع كافية في المصادر المحددة للإجابة. ارفع المصدر أو اختر كتاباً من المكتبة ثم أعد السؤال.",
-        citations: [],
-      };
+
+    // 1) الأولوية للمصادر المرفوعة/المختارة داخل المنصة
+    if (data.chunks.length > 0) {
+      const packed = data.chunks
+        .map(
+          (c, i) =>
+            `[#${i + 1} | ${c.title} | ${c.author} | ${c.edition} | ص ${c.page}${c.volume ? ` ج${c.volume}` : ""} | نوع:${c.kind}]\n${c.text}`,
+        )
+        .join("\n\n");
+      try {
+        const { text } = await complete(
+          [
+            { role: "system", content: POLICY },
+            {
+              role: "user",
+              content: `السؤال:\n${data.question}\n\nالمقاطع المعتمدة فقط:\n${packed}\n\nأجب من المقاطع فقط. إن لم تكفِ لجواب السؤال فعلاً فاجعل insufficient=true.\nأرجع JSON بالمفاتيح: answer, level (A|B|C|D), insufficient (boolean), fatwaReferral (boolean), notes (string[]), citations: [{sourceId,title,author,edition,page,volume,excerpt,kind,url}]`,
+            },
+          ],
+          1400,
+        );
+        const json = parseJson(text);
+        const insufficient = Boolean(json.insufficient);
+        if (!insufficient && String(json.answer ?? "").trim()) {
+          return {
+            ok: true,
+            answer: String(json.answer),
+            level: (json.level as ContentLevel) || "B",
+            insufficient: false,
+            fatwaReferral: Boolean(json.fatwaReferral),
+            notes: Array.isArray(json.notes) ? (json.notes as string[]) : [],
+            citations: Array.isArray(json.citations) ? (json.citations as AskResult["citations"]) : [],
+          };
+        }
+      } catch {
+        // ننتقل للبحث في المواقع المعتمدة
+      }
     }
-    const packed = data.chunks
-      .map(
-        (c, i) =>
-          `[#${i + 1} | ${c.title} | ${c.author} | ${c.edition} | ص ${c.page}${c.volume ? ` ج${c.volume}` : ""} | نوع:${c.kind}]\n${c.text}`,
-      )
-      .join("\n\n");
+
+    // 2) المقاطع لا تكفي: نبحث في مواقع المرجعية المعتمدة فقط
     try {
-      const raw = await complete(
-        [
-          { role: "system", content: POLICY },
-          {
-            role: "user",
-            content: `السؤال:\n${data.question}\n\nالمقاطع المعتمدة فقط:\n${packed}\n\nأرجع JSON بالمفاتيح: answer, level (A|B|C|D), insufficient (boolean), fatwaReferral (boolean), notes (string[]), citations: [{sourceId,title,author,edition,page,volume,excerpt,kind,url}]`,
-          },
-        ],
-        1400,
-      );
-      const json = parseJson(raw);
-      return {
-        ok: true,
-        answer: String(json.answer ?? ""),
-        level: (json.level as ContentLevel) || "B",
-        insufficient: Boolean(json.insufficient),
-        fatwaReferral: Boolean(json.fatwaReferral),
-        notes: Array.isArray(json.notes) ? (json.notes as string[]) : [],
-        citations: Array.isArray(json.citations)
-          ? (json.citations as AskResult["citations"])
-          : [],
-      };
+      return await askFromApprovedWeb(data.question);
     } catch {
-      return { ok: false, error: "تعذّر توليد الإجابة من المقاطع. يمكنك الاعتماد على نتائج المطابقة النصية." };
+      return {
+        ok: false,
+        error: "تعذّر توليد الإجابة الآن. يمكنك الاعتماد على نتائج المطابقة النصية.",
+      };
     }
   });
+
+// ---------- منهج المفسر ----------
 
 export const generateManhaj = createServerFn({ method: "POST" })
   .validator(
@@ -138,56 +283,60 @@ export const generateManhaj = createServerFn({ method: "POST" })
     if (!readKey()) {
       return { ok: false, error: "خدمة الذكاء غير متاحة. استخدم التقرير الجاهز للمصادر المعتمدة أو راجع الأصل يدوياً." };
     }
-    if (data.chunks.length === 0) {
-      return { ok: false, error: "لا توجد نصوص كافية في هذا المصدر لاستخراج المنهج." };
-    }
     const packed = data.chunks
-      .map(
-        (c) =>
-          `[ص ${c.page}${c.volume ? ` ج${c.volume}` : ""} | ${c.kind}]\n${c.text}`,
-      )
+      .map((c) => `[ص ${c.page}${c.volume ? ` ج${c.volume}` : ""} | ${c.kind}]\n${c.text}`)
       .join("\n\n");
     try {
-      const raw = await complete(
+      const { text, sources } = await complete(
         [
           { role: "system", content: POLICY },
           {
             role: "user",
-            content: `استخرج من المقاطع فقط تقرير منهج مفسر مناسب لتكليف جامعي في مناهج المفسرين.
-المصدر: ${data.sourceTitle}
+            content: `أعدّ تقرير منهج مفسر مناسباً لتكليف جامعي في مناهج المفسرين.
+الكتاب: ${data.sourceTitle}
 المؤلف: ${data.author}
 الطبعة: ${data.edition}
 ${data.focus ? `تركيز الطالب: ${data.focus}` : ""}
 
-المقاطع:
-${packed}
+المقاطع المرفقة من الكتاب (إن وُجدت، وهي المصدر الأول):
+${packed || "لا توجد مقاطع."}
 
-أرجع JSON:
+للمعلومات التي لا تكفي فيها المقاطع (الاسم والنسب والمولد والوفاة والشيوخ والتلاميذ والمؤلفات والمنهج)، ابحث في المواقع المعتمدة فقط: ${DOMAIN_LIST}
+لا تخترع تاريخاً ولا اسماً. ما لم تجده في المقاطع ولا في المواقع المعتمدة اكتب فيه "غير مصرَّح به في المصادر المعتمدة".
+الاقتباسات (quotes) لا تُكتب إلا من المقاطع المرفقة وبأرقام صفحاتها.
+
+أرجع JSON فقط، بلا أي نص خارجه:
 {
-  scholarName, nasab, born, died, birthplace, residence, teachers, students, works,
-  sections: [{ title, body, quotes: [{ excerpt, page, volume, kind }] }]
+  "scholarName": string, "nasab": string, "born": string, "died": string, "birthplace": string,
+  "residence": string, "teachers": string, "students": string, "works": string,
+  "sections": [{ "title": string, "body": string, "quotes": [{ "excerpt": string, "page": number, "volume": number, "kind": string }] }]
 }
-العناوين المطلوبة إن وُجدت مادتها: المنهج العام، العقيدة، الإسرائيليات، اللغة والقراءات، الأحكام. إن غاب الباب فصرّح أن المادة غير كافية في المقاطع. لا تخترع تاريخ وفاة أو مولداً إن لم يرد.`,
+العناوين المطلوبة إن وُجدت مادتها: المنهج العام، العقيدة، الإسرائيليات، اللغة والقراءات، الأحكام. إن غاب الباب فصرّح بذلك داخل body.`,
           },
         ],
-        2200,
+        3000,
+        { search: true },
       );
-      const json = parseJson(raw);
+      const json = parseJson(text);
+      const used = webCitations(sources);
       const sections = Array.isArray(json.sections) ? json.sections : [];
+      const NA = "غير مصرَّح به في المصادر المعتمدة";
       const report: ManhajReport = {
         sourceId: data.sourceId,
         scholarName: String(json.scholarName ?? data.author),
         nasab: String(json.nasab ?? data.author),
-        born: String(json.born ?? "غير مصرَّح به في المقاطع"),
-        died: String(json.died ?? "غير مصرَّح به في المقاطع"),
-        birthplace: String(json.birthplace ?? "غير مصرَّح به في المقاطع"),
-        residence: String(json.residence ?? "غير مصرَّح به في المقاطع"),
-        teachers: String(json.teachers ?? "غير مصرَّح به في المقاطع"),
-        students: String(json.students ?? "غير مصرَّح به في المقاطع"),
+        born: String(json.born ?? NA),
+        died: String(json.died ?? NA),
+        birthplace: String(json.birthplace ?? NA),
+        residence: String(json.residence ?? NA),
+        teachers: String(json.teachers ?? NA),
+        students: String(json.students ?? NA),
         works: String(json.works ?? data.sourceTitle),
         generatedBy: "model",
         disclaimer:
-          "مستخرج من المصدر الذي اخترته عبر أداة ذكاء اصطناعي مقيَّدة بالمقاطع. راجع الأصل قبل التسليم.",
+          "أُعدّ هذا التقرير بأداة ذكاء اصطناعي مقيَّدة بالمقاطع المرفقة ومواقع المرجعية العلمية المعتمدة." +
+          (used.length ? ` المواقع المستخدمة: ${used.map((u) => u.title).join("، ")}.` : "") +
+          " راجع الأصل قبل التسليم.",
         sections: sections.map((s: Record<string, unknown>) => ({
           title: String(s.title ?? ""),
           body: String(s.body ?? ""),
@@ -207,9 +356,11 @@ ${packed}
       };
       return { ok: true, report };
     } catch {
-      return { ok: false, error: "تعذّر استخراج المنهج من المقاطع المرفقة." };
+      return { ok: false, error: "تعذّر استخراج المنهج الآن. أعد المحاولة بعد لحظات." };
     }
   });
+
+// ---------- قراءة صورة (OCR) ----------
 
 export const ocrImage = createServerFn({ method: "POST" })
   .validator((input: { imageDataUrl: string; mime: string }) => input)
@@ -218,30 +369,24 @@ export const ocrImage = createServerFn({ method: "POST" })
       return { ok: false, error: "استخراج الصور يحتاج خدمة الذكاء، وهي غير متاحة الآن." };
     }
     try {
-      const raw = await complete(
+      const { text } = await complete(
         [
           {
             role: "system",
             content:
-              "استخرج النص العربي كما هو بالترتيب المنطقي (من اليمين لليسار). لا تترجم ولا تشرح. أرجع JSON { text } فقط.",
+              'استخرج النص العربي كما هو بالترتيب المنطقي (من اليمين لليسار). لا تترجم ولا تشرح. أرجع JSON { "text": string } فقط.',
           },
           {
             role: "user",
             content: [
-              {
-                type: "text",
-                text: "استخرج النص من هذه الصفحة.",
-              },
-              {
-                type: "image_url",
-                image_url: { url: data.imageDataUrl },
-              },
+              { type: "text", text: "استخرج النص من هذه الصفحة." },
+              { type: "image_url", image_url: { url: data.imageDataUrl } },
             ],
           },
         ],
         1800,
       );
-      const json = parseJson(raw);
+      const json = parseJson(text);
       return { ok: true, text: String(json.text ?? "") };
     } catch {
       return { ok: false, error: "تعذّر قراءة الصورة. جرّب صورة أوضح أو ملف PDF نصّي." };
