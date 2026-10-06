@@ -20,6 +20,7 @@ import { Button } from "@/components/ui/button";
 import { DiffView, ScoreRing } from "@/components/naql/diff-view";
 import { PageReader } from "@/components/naql/page-reader";
 import { askFromSources, generateManhaj, ocrImage } from "@/lib/naql/ai";
+import { APPROVED_SOURCES } from "@/lib/naql/approved-sources";
 import {
   formatCitation,
   formatInlineQuote,
@@ -225,6 +226,21 @@ function SourceRail({
           );
         })}
       </ul>
+      <details className="rounded-lg border border-line bg-paper-2 px-3 py-2.5">
+        <summary className="cursor-pointer text-sm text-navy">
+          مواقع المرجعية المعتمدة ({APPROVED_SOURCES.length})
+        </summary>
+        <p className="mt-2 text-xs leading-6 text-mist">
+          عند عدم كفاية المصادر المرفوعة، يبحث «نقل» في هذه المواقع فقط:
+        </p>
+        <ul className="mt-2 space-y-1">
+          {APPROVED_SOURCES.map((a) => (
+            <li key={a.domain} className="text-xs text-ink">
+              {a.name} <span className="text-mist">· {a.domain}</span>
+            </li>
+          ))}
+        </ul>
+      </details>
     </div>
   );
 }
@@ -455,7 +471,7 @@ function ManhajPanel({ sources }: { sources: Source[] }) {
     setBusy(false);
     if (!out.ok || !out.report) {
       toast.error(out.error ?? "تعذّر الاستخراج");
-      if (ready) setReport(ready);
+      setReport(ready ?? null);
       return;
     }
     setReport(out.report);
@@ -478,7 +494,7 @@ function ManhajPanel({ sources }: { sources: Source[] }) {
             onChange={(e) => {
               setSourceId(e.target.value);
               const ready = curatedManhaj(e.target.value);
-              if (ready) setReport(ready);
+              setReport(ready ?? null);
             }}
             className="h-11 w-full rounded-md border border-line bg-paper-2 px-3 text-ink outline-none focus:ring-2 focus:ring-accent/40"
           >
@@ -686,14 +702,25 @@ function AskPanel({
             <ul className="mt-4 space-y-2">
               {answer.citations.map((c, i) => (
                 <li key={`${c.sourceId}-${c.page}-${i}`}>
-                  <button
-                    type="button"
-                    className="text-start text-sm text-mist hover:text-accent"
-                    onClick={() => onOpenPage?.(c.sourceId, c.page, c.excerpt)}
-                  >
-                    {c.author} · {c.title} · ص {c.page}
-                    {c.excerpt ? ` — «${c.excerpt.slice(0, 90)}…»` : ""}
-                  </button>
+                  {c.sourceId.startsWith("web:") && c.url ? (
+                    <a
+                      href={c.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-start text-sm text-mist hover:text-accent"
+                    >
+                      مصدر معتمد · {c.title}
+                    </a>
+                  ) : (
+                    <button
+                      type="button"
+                      className="text-start text-sm text-mist hover:text-accent"
+                      onClick={() => onOpenPage?.(c.sourceId, c.page, c.excerpt)}
+                    >
+                      {c.author} · {c.title} · ص {c.page}
+                      {c.excerpt ? ` — «${c.excerpt.slice(0, 90)}…»` : ""}
+                    </button>
+                  )}
                 </li>
               ))}
             </ul>
